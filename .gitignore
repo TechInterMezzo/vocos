@@ -164,3 +164,6 @@ logs/
 *.ckpt
 
 *.bat
+
+filelist.train
+filelist.val
