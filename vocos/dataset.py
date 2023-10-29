@@ -56,7 +56,9 @@ class VocosDataset(Dataset):
             # mix to mono
             y = y.mean(dim=0, keepdim=True)
         gain = np.random.uniform(-1, -6) if self.train else -3
-        y, _ = torchaudio.sox_effects.apply_effects_tensor(y, sr, [["norm", f"{gain:.2f}"]])
+
+        y = normalize(y, gain)
+
         if sr != self.sampling_rate:
             y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=self.sampling_rate)
         if y.size(-1) < self.num_samples:
@@ -71,3 +73,8 @@ class VocosDataset(Dataset):
             y = y[:, : self.num_samples]
 
         return y[0]
+
+def normalize(samples, rms_level = 0):
+    r = 10**(rms_level / 10.0)
+    a = ((samples.size(0) * r ** 2) / (samples ** 2).sum()).sqrt()
+    return samples * a
