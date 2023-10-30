@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vocos.activation import APTx
+
 
 class ConvNeXtBlock(nn.Module):
     """ConvNeXt Block adapted from https://github.com/facebookresearch/ConvNeXt to 1D audio signal.
@@ -40,6 +42,7 @@ class ConvNeXtBlock(nn.Module):
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
+        #x = APTx.apply(x)
         x = self.pwconv2(x)
         if self.gamma is not None:
             x = self.gamma * x

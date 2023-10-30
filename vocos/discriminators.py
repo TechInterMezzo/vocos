@@ -5,9 +5,10 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from torch.nn import Conv2d
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 from torchaudio.transforms import Spectrogram
 
+from vocos.activation import APTx
 from vocos.modules import SANConv2d
 
 
@@ -81,6 +82,7 @@ class DiscriminatorP(nn.Module):
         for i, l in enumerate(self.convs):
             x = l(x)
             x = F.leaky_relu(x, self.lrelu_slope)
+            #x = APTx.apply(x)
             if i > 0:
                 fmap.append(x)
         x = self.conv_post(x, flg_train=flg_train)
@@ -186,6 +188,7 @@ class DiscriminatorR(nn.Module):
         for band, stack in zip(x_bands, self.band_convs):
             for i, layer in enumerate(stack):
                 band = layer(band)
+                #band = APTx.apply(band)
                 band = F.leaky_relu(band, self.lrelu_slope)
                 if i > 0:
                     fmap.append(band)

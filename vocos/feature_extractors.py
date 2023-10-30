@@ -8,7 +8,7 @@ from vocos.modules import safe_log
 class FeatureExtractor(nn.Module):
     """Base class for feature extractors."""
 
-    def forward(self, audio: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """
         Extract features from the given audio.
 
@@ -23,7 +23,7 @@ class FeatureExtractor(nn.Module):
 
 
 class MelSpectrogramFeatures(FeatureExtractor):
-    def __init__(self, sample_rate=24000, n_fft=1024, hop_length=256, n_mels=100, padding="center"):
+    def __init__(self, sample_rate: int, n_fft: int, hop_length: int, n_mels: int, padding: str):
         super().__init__()
         if padding not in ["center", "same"]:
             raise ValueError("Padding must be 'center' or 'same'.")
@@ -37,7 +37,7 @@ class MelSpectrogramFeatures(FeatureExtractor):
             power=1,
         )
 
-    def forward(self, audio, **kwargs):
+    def forward(self, audio: torch.Tensor) -> torch.Tensor:
         if self.padding == "same":
             pad = self.mel_spec.win_length - self.mel_spec.hop_length
             audio = torch.nn.functional.pad(audio, (pad // 2, pad // 2), mode="reflect")

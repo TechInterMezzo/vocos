@@ -1,7 +1,11 @@
-pytorch_lightning==1.8.6
+pytorch_lightning
 jsonargparse[signatures]
+huggingface_hub
 transformers
+pytorch_optimizer
+einops
 matplotlib
+fairseq
+librosa
 torchcrepe
 pesq
-fairseq
