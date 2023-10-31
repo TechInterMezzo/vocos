@@ -1,10 +1,13 @@
-from tqdm import trange
+import numpy as np
+
+from tqdm import tqdm
+
 import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from lightning.fabric import Fabric, seed_everything
+from lightning.fabric import Fabric
 from lightning.fabric.loggers import TensorBoardLogger
 
 from pytorch_optimizer import Prodigy
@@ -16,12 +19,11 @@ from vocos.heads import ISTFTHead
 from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
 from vocos.loss import DiscriminatorLoss, GeneratorLoss, FeatureMatchingLoss, MelSpecReconstructionLoss
 
-BATCH_SIZE = 16
+BATCH_SIZE_PER_GB = 2.66
+NUM_EPOCHS = 1000
 NUM_SAMPLES = 16384
 NUM_WORKERS = 8
-NUM_EPOCHS = 1000
 LEARNING_RATE = 5e-4
-MAX_STEPS = 1_000_000
 USE_PRODIGY = True
 
 class Generator(nn.Module):
@@ -45,28 +47,29 @@ class Discriminator(nn.Module):
         self.multi_resolution = MultiResolutionDiscriminator()
 
 def main():
-    seed_everything(4444)
-
-    torch.set_float32_matmul_precision("high")
+    #torch.set_float32_matmul_precision("high")
+    gpu = torch.cuda.get_device_properties(0)
+    batch_size = int((round(gpu.total_memory / (1024 ** 3)) - 1) * BATCH_SIZE_PER_GB)
+    mr_loss_coeff = 0.1
+    mel_loss_coeff = 45
 
     logger = TensorBoardLogger(root_dir="logs")
 
-    fabric = Fabric(accelerator="auto", loggers=logger)
+    fabric = Fabric(loggers=logger, precision="bf16-mixed")
     fabric.launch()
+    fabric.seed_everything(4444)
 
     dataset = VocosDataset(filelist_path="filelist.train", sampling_rate=24000, num_samples=NUM_SAMPLES, train=True)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    dataloader = DataLoader(dataset, batch_size, shuffle=True, num_workers=NUM_WORKERS)
 
-    generator = Generator()
-    discriminator = Discriminator()
+    with fabric.init_module():
+        generator = Generator()
+        discriminator = Discriminator()
 
-    discriminator_loss = DiscriminatorLoss()
-    generator_loss = GeneratorLoss()
-    feature_loss = FeatureMatchingLoss()
-    mel_loss = MelSpecReconstructionLoss()
-
-    mr_loss_coeff = 0.1
-    mel_loss_coeff = 45
+        discriminator_loss = DiscriminatorLoss()
+        generator_loss = GeneratorLoss()
+        feature_loss = FeatureMatchingLoss()
+        mel_loss = MelSpecReconstructionLoss()
 
     if USE_PRODIGY:
         optimizer_g = Prodigy(generator.parameters(), lr=1.0, betas=(0.8, 0.9), weight_decay=0.01, safeguard_warmup=True, bias_correction=True)
@@ -75,23 +78,30 @@ def main():
         optimizer_g = AdamW(generator.parameters(), lr=LEARNING_RATE, betas=(0.8, 0.9))
         optimizer_d = AdamW(discriminator.parameters(), lr=LEARNING_RATE, betas=(0.8, 0.9))
 
-    scheduler_g = CosineAnnealingLR(optimizer_g, T_max=MAX_STEPS)
-    scheduler_d = CosineAnnealingLR(optimizer_d, T_max=MAX_STEPS)
+    scheduler_g = CosineAnnealingLR(optimizer_g, T_max=NUM_EPOCHS)
+    scheduler_d = CosineAnnealingLR(optimizer_d, T_max=NUM_EPOCHS)
 
     generator, optimizer_g = fabric.setup(generator, optimizer_g)
     discriminator, optimizer_d = fabric.setup(discriminator, optimizer_d)
 
     dataloader = fabric.setup_dataloaders(dataloader)
 
-    fabric.to_device(discriminator_loss)
-    fabric.to_device(generator_loss)
-    fabric.to_device(feature_loss)
-    fabric.to_device(mel_loss)
-
     step = 0
+    losses = {
+        "discriminator/total_loss": [],
+        "discriminator/multi_period_loss": [],
+        "discriminator/multi_resolution_loss": [],
+        "generator/multi_period_loss": [],
+        "generator/multi_resolution_loss": [],
+        "generator/fm_mp_loss": [],
+        "generator/fm_mr_loss": [],
+        "generator/mel_loss": [],
+        "generator/total_loss": []
+    }
     for epoch in range(NUM_EPOCHS):
-        with trange(len(dataloader)) as t:
-            for i, data in zip(t, dataloader):
+        with tqdm(dataloader) as t:
+            t.set_description(f"Epoch {epoch}")
+            for data in t:
                 audio_real = data
                 audio_fake = generator(audio_real)
 
@@ -106,12 +116,6 @@ def main():
                 loss_mr /= len(loss_mr_real)
                 loss_d = loss_mp + mr_loss_coeff * loss_mr
 
-                fabric.log_dict({
-                    "discriminator/total_loss": loss_d,
-                    "discriminator/multi_period_loss": loss_mp,
-                    "discriminator/multi_resolution_loss": loss_mr
-                }, step)
-
                 fabric.backward(loss_d)
                 optimizer_d.step()
 
@@ -122,38 +126,47 @@ def main():
 
                 loss_fake_mp, list_loss_fake_mp = generator_loss(fake_score_mp)
                 loss_fake_mr, list_loss_fake_mr = generator_loss(fake_score_mr)
-                loss_fake_mp = loss_fake_mp / len(list_loss_fake_mp)
-                loss_fake_mr = loss_fake_mr / len(list_loss_fake_mr)
+                loss_fake_mp /= len(list_loss_fake_mp)
+                loss_fake_mr /= len(list_loss_fake_mr)
                 loss_fmap_mp = feature_loss(fmap_real_mp, fmap_fake_mp)
                 loss_fmap_mr = feature_loss(fmap_real_mr, fmap_fake_mr)
 
                 loss_mel = mel_loss(audio_fake, audio_real)
                 loss_g = loss_fake_mp + mr_loss_coeff * loss_fake_mr + loss_fmap_mp + mr_loss_coeff * loss_fmap_mr + mel_loss_coeff * loss_mel
 
-                fabric.log_dict({
-                    "generator/multi_period_loss": loss_fake_mp,
-                    "generator/multi_resolution_loss": loss_fake_mr,
-                    "generator/feature_matching_mp": loss_fmap_mp,
-                    "generator/feature_matching_mr": loss_fmap_mr,
-                    "generator/mel_loss": loss_mel,
-                    "generator/total_loss": loss_g
-                }, step)
-
                 fabric.backward(loss_g)
                 optimizer_g.step()
 
-                t.set_postfix({
-                    "D": loss_d.item(),
-                    "G": loss_g.item()
-                })
+                losses["discriminator/total_loss"].append(loss_d.item())
+                losses["discriminator/multi_period_loss"].append(loss_mp.item())
+                losses["discriminator/multi_resolution_loss"].append(loss_mr.item())
+                losses["generator/multi_period_loss"].append(loss_fake_mp.item())
+                losses["generator/multi_resolution_loss"].append(loss_fake_mr.item())
+                losses["generator/fm_mp_loss"].append(loss_fmap_mp.item())
+                losses["generator/fm_mr_loss"].append(loss_fmap_mr.item())
+                losses["generator/mel_loss"].append(loss_mel.item())
+                losses["generator/total_loss"].append(loss_g.item())
+
+                if step % 10 == 0:
+                    t.set_postfix({
+                        "D": loss_d.item(),
+                        "G": loss_g.item()
+                    })
 
                 if step % 100 == 0:
+                    record = {}
+                    for key in losses:
+                        record[key] = np.mean(losses[key])
+                        losses[key] = []
+                    fabric.log_dict(record, step)
+
+                if step % 1000 == 0:
                     fabric.logger.experiment.add_audio("train/audio_fake", audio_fake[0].data.cpu(), step, 24000)
 
                 step += 1
 
-                scheduler_d.step()
-                scheduler_g.step()
+        scheduler_d.step()
+        scheduler_g.step()
 
 
 if __name__ == "__main__":
